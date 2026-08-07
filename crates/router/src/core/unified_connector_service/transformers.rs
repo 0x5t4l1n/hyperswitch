@@ -5941,6 +5941,7 @@ impl ForeignFrom<common_enums::PaymentMethodType> for payments_grpc::PaymentMeth
             common_enums::PaymentMethodType::Momo => Self::Momo,
             common_enums::PaymentMethodType::MomoAtm => Self::MomoAtm,
             common_enums::PaymentMethodType::Multibanco => Self::Multibanco,
+            common_enums::PaymentMethodType::OpenBanking => Self::OpenBanking,
             common_enums::PaymentMethodType::OnlineBankingThailand => Self::OnlineBankingThailand,
             common_enums::PaymentMethodType::OnlineBankingCzechRepublic => {
                 Self::OnlineBankingCzechRepublic
@@ -8629,12 +8630,11 @@ impl transformers::ForeignTryFrom<&api_models::payouts::PayoutMethodData>
                             .to_string(),
                     ),
                 ))?,
-                api_models::payouts::Bank::OpenBanking(_) => Err(error_stack::Report::new(
-                    UnifiedConnectorServiceError::RequestEncodingFailedWithReason(
-                        "OpenBanking bank transfer not supported for Unified Connector Service"
-                            .to_string(),
-                    ),
-                ))?,
+                api_models::payouts::Bank::OpenBanking(open_banking) => {
+                    payments_grpc::payout_method::PayoutMethodData::OpenBanking(
+                        payments_grpc::OpenBankingPayout::foreign_try_from(open_banking)?,
+                    )
+                },
                 api_models::payouts::Bank::Payshap(_) => Err(error_stack::Report::new(
                     UnifiedConnectorServiceError::RequestEncodingFailedWithReason(
                         "Payshap bank transfer not supported for Unified Connector Service"
@@ -8688,13 +8688,10 @@ impl transformers::ForeignTryFrom<&api_models::payouts::PayoutMethodData>
                             payments_grpc::PixEmvBankTransferPayout::foreign_from(pix_emv),
                         )
                     }
-                    api_models::payouts::BankTransfer::OpenBanking(_) => {
-                        Err(error_stack::Report::new(
-                            UnifiedConnectorServiceError::RequestEncodingFailedWithReason(
-                                "OpenBanking bank transfer not supported for Unified Connector Service"
-                                    .to_string(),
-                            ),
-                        ))?
+                    api_models::payouts::BankTransfer::OpenBanking(open_banking) => {
+                        payments_grpc::payout_method::PayoutMethodData::OpenBanking(
+                            payments_grpc::OpenBankingPayout::foreign_try_from(open_banking)?,
+                        )
                     }
                     api_models::payouts::BankTransfer::Payshap(_) => Err(error_stack::Report::new(
                         UnifiedConnectorServiceError::RequestEncodingFailedWithReason(
@@ -8716,12 +8713,14 @@ impl transformers::ForeignTryFrom<&api_models::payouts::PayoutMethodData>
                         payments_grpc::ApplePayDecrypt::foreign_try_from(apple_pay)?,
                     )
                 }
-                 api_models::payouts::Wallet::GooglePayDecrypt(_google_pay) => Err(error_stack::Report::new(
-                    UnifiedConnectorServiceError::RequestEncodingFailedWithReason(
-                        "Googlepay wallet not supported for Unified Connector Service"
-                            .to_string(),
-                    ),
-                ))?,
+                api_models::payouts::Wallet::GooglePayDecrypt(_google_pay) => {
+                    Err(error_stack::Report::new(
+                        UnifiedConnectorServiceError::RequestEncodingFailedWithReason(
+                            "Googlepay wallet not supported for Unified Connector Service"
+                                .to_string(),
+                        ),
+                    ))?
+                }
                 api_models::payouts::Wallet::Paypal(paypal) => {
                     payments_grpc::payout_method::PayoutMethodData::Paypal(
                         payments_grpc::Paypal::foreign_try_from(paypal)?,
@@ -8732,7 +8731,6 @@ impl transformers::ForeignTryFrom<&api_models::payouts::PayoutMethodData>
                         payments_grpc::Venmo::foreign_try_from(venmo)?,
                     )
                 }
-
             },
             api_models::payouts::PayoutMethodData::BankRedirect(bank_redirect) => {
                 match bank_redirect {
@@ -8968,6 +8966,20 @@ impl transformers::ForeignTryFrom<&api_models::payouts::Interac> for payments_gr
     fn foreign_try_from(item: &api_models::payouts::Interac) -> Result<Self, Self::Error> {
         Ok(Self {
             email: Some(Secret::new(item.email.clone().expose().expose())),
+        })
+    }
+}
+
+#[cfg(feature = "payouts")]
+impl transformers::ForeignTryFrom<&api_models::payouts::OpenBanking>
+    for payments_grpc::OpenBankingPayout
+{
+    type Error = error_stack::Report<UnifiedConnectorServiceError>;
+
+    fn foreign_try_from(item: &api_models::payouts::OpenBanking) -> Result<Self, Self::Error> {
+        Ok(Self {
+            account_holder_name: Some(item.account_holder_name.clone()),
+            iban: Some(item.iban.clone()),
         })
     }
 }
