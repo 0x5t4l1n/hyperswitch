@@ -230,6 +230,10 @@ pub enum UnifiedConnectorServiceError {
     #[error("Failed to perform Surcharge Calculate from gRPC Server")]
     SurchargeCalculateFailure,
 
+    /// Failed to perform FRM Pre Risk Check from gRPC Server
+    #[error("Failed to perform FRM Pre Risk Check from gRPC Server")]
+    FrmPreRiskCheckFailure,
+
     /// Failed to perform Notify Connector via gRPC Server
     #[error("Failed to perform Notify Connector from gRPC Server")]
     NotifyConnectorFailure,
@@ -2096,6 +2100,7 @@ impl ErrorSwitch<ConnectorError> for UnifiedConnectorServiceError {
             | Self::PayoutStageFailure
             | Self::PayoutCreateRecipientFailure
             | Self::SurchargeCalculateFailure
+            | Self::FrmPreRiskCheckFailure
             | Self::PayoutEnrollDisburseAccountFailure
             | Self::NotifyConnectorFailure => ConnectorError::ResponseHandlingFailed,
         }
@@ -2236,6 +2241,7 @@ impl UnifiedConnectorServiceError {
             | Self::PayoutCreateRecipientFailure
             | Self::PayoutEnrollDisburseAccountFailure
             | Self::SurchargeCalculateFailure
+            | Self::FrmPreRiskCheckFailure
             | Self::NotifyConnectorFailure => Some(UcsKillSwitchReason::UcsInternalError),
         }
     }

@@ -129,6 +129,86 @@ where
         frm_data.fraud_check.last_step = FraudCheckLastStep::TransactionOrRecordRefund
     }
 
+    // UCS-backed FRM providers (e.g. nSure) have no in-process connector: the
+    // risk evaluation is executed by the connector-service, which owns the
+    // provider-specific transformation. Only the pre-authorization risk
+    // evaluation is routed there; the notify-style flows have no UCS equivalent
+    // yet and continue down the native path below.
+    //
+    // `pre_payment_frm_core` invokes `call_frm_service` twice for a Pre flow —
+    // once for Checkout and once for Transaction — and both carry
+    // `FraudCheckType::PreFrm`. Only the first is a risk *evaluation*; the
+    // second is a notification whose result is discarded by the caller. Gating
+    // on `last_step == Processing` (set at row insert, advanced to
+    // `CheckoutOrSale` after the first call) ensures nSure is asked exactly once
+    // per payment, so the provider is not billed twice and does not see a
+    // repeated `uniqueRequestId`.
+    #[cfg(feature = "v1")]
+    if matches!(
+        frm_data.fraud_check.frm_transaction_type,
+        FraudCheckType::PreFrm
+    ) && matches!(
+        frm_data.fraud_check.last_step,
+        FraudCheckLastStep::Processing
+    ) {
+        use common_utils::ext_traits::ValueExt;
+
+        // Routed to UCS only when configuration says so (`ucs_frm_connectors`)
+        // and UCS is actually available — see
+        // `should_call_unified_connector_service_for_frm`.
+        if crate::core::unified_connector_service::frm::should_call_unified_connector_service_for_frm(
+            state,
+            &frm_data.connector_details.connector_name,
+        )
+        .await
+        {
+            let currency = frm_data.payment_attempt.currency.ok_or(
+                errors::ApiErrorResponse::MissingRequiredField {
+                    field_name: "currency",
+                },
+            )?;
+
+            // `browser_info` is stored as raw JSON on the attempt; user agent and
+            // IP are what the risk provider needs for device context.
+            let browser_info = frm_data
+                .payment_attempt
+                .browser_info
+                .clone()
+                .and_then(|value| {
+                    value
+                        .parse_value::<hyperswitch_domain_models::router_request_types::BrowserInformation>(
+                            "BrowserInformation",
+                        )
+                        .ok()
+                });
+
+            let context = crate::core::unified_connector_service::frm::FrmPreRiskCheckContext {
+                amount: frm_data.payment_attempt.net_amount.get_total_amount(),
+                currency,
+                customer_id: frm_data.payment_intent.customer_id.as_ref(),
+                browser_info: browser_info.as_ref(),
+                address: &frm_data.address,
+                order_details: frm_data.order_details.as_ref(),
+                merchant_transaction_id: frm_data.payment_attempt.attempt_id.clone(),
+                frm_metadata: frm_data.frm_metadata.as_ref(),
+            };
+
+            let response =
+                crate::core::unified_connector_service::frm::call_unified_connector_service_for_frm_pre_risk_check(
+                    state,
+                    platform.get_processor(),
+                    merchant_connector_account.clone(),
+                    frm_data.connector_details.connector_name.clone(),
+                    &frm_data.connector_details.profile_id,
+                    context,
+                )
+                .await?;
+
+            router_data.response = Ok(response);
+            return Ok(router_data);
+        }
+    }
+
     let connector =
         FraudCheckConnectorData::get_connector_by_name(&frm_data.connector_details.connector_name)?;
     let router_data_res = router_data

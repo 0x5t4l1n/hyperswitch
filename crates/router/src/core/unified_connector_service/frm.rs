@@ -1,0 +1,322 @@
+//! Bridge from Hyperswitch's FRM core to the Unified Connector Service.
+//!
+//! Native FRM providers (Signifyd, Riskified, CyberSource Decision Manager) run
+//! in-process. UCS-backed providers instead have their risk evaluation executed
+//! by the connector-service, which owns the provider-specific transformation.
+//!
+//! ```text
+//! FrmData                        ──▶ FrmServicePreRiskCheckRequest
+//! FrmServicePreRiskCheckResponse ──▶ FraudCheckResponseData
+//! ```
+//!
+//! The merchant's `frm_metadata` is forwarded verbatim as
+//! `connector_feature_data`. That is how provider-specific signals (device
+//! fingerprint, account tenure, velocity counters) reach the connector without
+//! Hyperswitch needing to model them — the same escape hatch Signifyd uses for
+//! its device `session_id`.
+
+use std::str::FromStr;
+
+use common_enums::connector_enums::Connector;
+use common_utils::{errors::CustomResult, id_type, types::MinorUnit};
+use error_stack::ResultExt;
+use hyperswitch_domain_models::{
+    router_request_types::ResponseId, router_response_types::fraud_check::FraudCheckResponseData,
+    types::OrderDetailsWithAmount,
+};
+use hyperswitch_interfaces::unified_connector_service::transformers;
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
+use unified_connector_service_client::payments as payments_grpc;
+
+use super::{build_unified_connector_service_auth_metadata, get_ucs_client};
+use external_services::grpc_client::LineageIds;
+use hyperswitch_domain_models::platform::Processor;
+use hyperswitch_interfaces::unified_connector_service::UnifiedConnectorServiceError;
+
+use crate::{
+    core::{
+        errors::{self, RouterResult},
+        payments::helpers::MerchantConnectorAccountType,
+    },
+    routes::SessionState,
+    types::transformers::ForeignTryFrom,
+};
+
+/// Decide whether this FRM connector's risk evaluation should be executed by
+/// the connector-service.
+///
+/// Mirrors `should_call_unified_connector_service` for payments: the connector
+/// must be listed in `ucs_frm_connectors`, and UCS must actually be available
+/// (client constructed and `UCS_ENABLED` set). Nothing is hardcoded — a
+/// connector is routed to UCS only because configuration says so.
+///
+/// Unlike payments there is no Direct or Shadow path: a UCS-backed FRM provider
+/// has no in-process connector to fall back to or shadow against, so the result
+/// is a plain "use UCS or don't".
+pub async fn should_call_unified_connector_service_for_frm(
+    state: &SessionState,
+    connector_name: &str,
+) -> bool {
+    let Ok(connector) = Connector::from_str(connector_name) else {
+        router_env::logger::debug!(
+            connector = connector_name,
+            "FRM connector name is not a known connector; not routing to UCS"
+        );
+        return false;
+    };
+
+    let Some(ucs_config) = state.conf.grpc_client.unified_connector_service.as_ref() else {
+        router_env::logger::debug!("UCS config not present; FRM will not be routed to UCS");
+        return false;
+    };
+
+    if !ucs_config.ucs_frm_connectors.contains(&connector) {
+        router_env::logger::debug!(
+            connector = ?connector,
+            "FRM connector not in ucs_frm_connectors; not routing to UCS"
+        );
+        return false;
+    }
+
+    // The connector is configured for UCS, so there is no native path. If UCS is
+    // unavailable the risk evaluation cannot run at all — surface that clearly
+    // rather than letting it look like a connector error.
+    match super::check_ucs_availability(state).await {
+        common_enums::UcsAvailability::Enabled => true,
+        common_enums::UcsAvailability::Disabled => {
+            router_env::logger::error!(
+                connector = ?connector,
+                "UCS is unavailable but FRM connector has no in-process implementation; \
+                 the risk evaluation will not run for this payment"
+            );
+            false
+        }
+    }
+}
+
+/// The facts a pre-risk-check needs, gathered from `FrmData` at the call site.
+///
+/// Named fields rather than positional arguments: `amount`/`currency` and the
+/// several `Option<&…>` values are easy to transpose in a long parameter list,
+/// and the compiler would not catch it.
+pub struct FrmPreRiskCheckContext<'a> {
+    pub amount: MinorUnit,
+    pub currency: common_enums::Currency,
+    pub customer_id: Option<&'a id_type::CustomerId>,
+    pub browser_info:
+        Option<&'a hyperswitch_domain_models::router_request_types::BrowserInformation>,
+    pub address: &'a hyperswitch_domain_models::payment_address::PaymentAddress,
+    pub order_details: Option<&'a Vec<OrderDetailsWithAmount>>,
+    pub merchant_transaction_id: String,
+    /// Merchant-supplied provider signals (device id, tenure, velocity, …),
+    /// forwarded verbatim as `connector_feature_data`.
+    pub frm_metadata: Option<&'a common_utils::pii::SecretSerdeValue>,
+}
+
+impl ForeignTryFrom<FrmPreRiskCheckContext<'_>> for payments_grpc::FrmServicePreRiskCheckRequest {
+    type Error = error_stack::Report<UnifiedConnectorServiceError>;
+
+    fn foreign_try_from(ctx: FrmPreRiskCheckContext<'_>) -> Result<Self, Self::Error> {
+        let grpc_currency = payments_grpc::Currency::foreign_try_from(ctx.currency)?;
+
+        let amount = payments_grpc::Money {
+            minor_amount: ctx.amount.get_amount_as_i64(),
+            currency: grpc_currency.into(),
+        };
+
+        // `customer_id` is the stable merchant-side key risk providers use to
+        // build cross-transaction history for the buyer.
+        let customer_info = ctx.customer_id.map(|id| payments_grpc::Customer {
+            id: Some(id.get_string_repr().to_owned()),
+            ..Default::default()
+        });
+
+        let browser_info = ctx
+            .browser_info
+            .map(|info| payments_grpc::BrowserInformation {
+                user_agent: info.user_agent.clone(),
+                ip_address: info.ip_address.map(|ip| ip.to_string()),
+                language: info.language.clone(),
+                accept_header: info.accept_header.clone(),
+                ..Default::default()
+            });
+
+        let order_details = ctx
+            .order_details
+            .map(|details| details.iter().map(build_order_detail).collect())
+            .unwrap_or_default();
+
+        Ok(Self {
+            amount: Some(amount),
+            customer_info,
+            browser_info,
+            merchant_transaction_id: Some(ctx.merchant_transaction_id),
+            order_details,
+            address: build_payment_address(ctx.address),
+            connector_feature_data: ctx
+                .frm_metadata
+                .map(|metadata| Secret::new(metadata.clone().expose().to_string())),
+            ..Default::default()
+        })
+    }
+}
+
+fn build_order_detail(detail: &OrderDetailsWithAmount) -> payments_grpc::OrderDetailsWithAmount {
+    payments_grpc::OrderDetailsWithAmount {
+        product_name: detail.product_name.clone(),
+        quantity: u32::from(detail.quantity),
+        amount: detail.amount.get_amount_as_i64(),
+        requires_shipping: detail.requires_shipping,
+        product_id: detail.product_id.clone(),
+        category: detail.category.clone(),
+        sub_category: detail.sub_category.clone(),
+        brand: detail.brand.clone(),
+        // `sku` / `product_link` exist on the UCS proto but not on
+        // Hyperswitch's domain type, so they are left unset here.
+        ..Default::default()
+    }
+}
+
+fn build_payment_address(
+    address: &hyperswitch_domain_models::payment_address::PaymentAddress,
+) -> Option<payments_grpc::PaymentAddress> {
+    let billing_address = address.get_payment_billing().map(build_address);
+    let shipping_address = address.get_shipping().map(build_address);
+    (billing_address.is_some() || shipping_address.is_some()).then_some(
+        payments_grpc::PaymentAddress {
+            billing_address,
+            shipping_address,
+        },
+    )
+}
+
+fn build_address(address: &hyperswitch_domain_models::address::Address) -> payments_grpc::Address {
+    let details = address.address.as_ref();
+    let secret = |value: Option<&Secret<String>>| value.cloned();
+    payments_grpc::Address {
+        first_name: secret(details.and_then(|d| d.first_name.as_ref())),
+        last_name: secret(details.and_then(|d| d.last_name.as_ref())),
+        line1: secret(details.and_then(|d| d.line1.as_ref())),
+        line2: secret(details.and_then(|d| d.line2.as_ref())),
+        line3: secret(details.and_then(|d| d.line3.as_ref())),
+        city: details.and_then(|d| d.city.clone()).map(Secret::new),
+        state: secret(details.and_then(|d| d.state.as_ref())),
+        zip_code: secret(details.and_then(|d| d.zip.as_ref())),
+        country_alpha2_code: details
+            .and_then(|d| d.country)
+            .and_then(|country| payments_grpc::CountryAlpha2::from_str_name(&country.to_string()))
+            .map(|code| code.into()),
+        email: address
+            .email
+            .as_ref()
+            .map(|email| Secret::new(email.peek().to_owned())),
+        phone_number: secret(
+            address
+                .phone
+                .as_ref()
+                .and_then(|phone| phone.number.as_ref()),
+        ),
+        phone_country_code: address
+            .phone
+            .as_ref()
+            .and_then(|phone| phone.country_code.clone()),
+    }
+}
+
+/// Convert the UCS verdict back into Hyperswitch's FRM response shape.
+///
+/// Deliberately conservative: anything that is not an explicit approval leaves
+/// the transaction short of `Legit`, so an unrecognised or missing verdict never
+/// silently approves a payment.
+pub fn handle_unified_connector_service_response_for_frm_pre_risk_check(
+    response: payments_grpc::FrmServicePreRiskCheckResponse,
+) -> CustomResult<FraudCheckResponseData, UnifiedConnectorServiceError> {
+    use payments_grpc::FrmDecision;
+
+    // Same status-code handling every payments UCS handler performs: a
+    // non-success code from the connector-service means the provider never
+    // produced a verdict, so it must not be read as an implicit approval.
+    let status_code = transformers::convert_connector_service_status_code(response.status_code)?;
+
+    let decision = response
+        .frm_decision
+        .and_then(|decision| FrmDecision::try_from(decision).ok());
+
+    let status = match (status_code, decision) {
+        (200..=299, Some(FrmDecision::Approve)) => diesel_models::enums::FraudCheckStatus::Legit,
+        (200..=299, Some(FrmDecision::Reject)) => diesel_models::enums::FraudCheckStatus::Fraud,
+        (200..=299, Some(FrmDecision::Review)) => {
+            diesel_models::enums::FraudCheckStatus::ManualReview
+        }
+        // `Error`/`Unspecified`/absent verdict, or any non-2xx status: the
+        // provider gave us nothing usable. Hold for review rather than approve.
+        (200..=299, _) => diesel_models::enums::FraudCheckStatus::ManualReview,
+        (code, _) => {
+            router_env::logger::warn!(
+                status_code = code,
+                "FRM pre risk check returned a non-success status; treating as manual review"
+            );
+            diesel_models::enums::FraudCheckStatus::ManualReview
+        }
+    };
+
+    Ok(FraudCheckResponseData::TransactionResponse {
+        resource_id: response
+            .frm_transaction_id
+            .clone()
+            .map(ResponseId::ConnectorTransactionId)
+            .unwrap_or(ResponseId::NoResponseId),
+        status,
+        connector_metadata: None,
+        reason: response.reason.map(serde_json::Value::String),
+        score: response.risk_score,
+    })
+}
+
+/// Execute the pre-authorization risk check against the connector-service.
+///
+/// Mirrors `call_unified_connector_service_for_surcharge_calculate`; the
+/// connector name travels as `x-frm-connector` rather than `x-connector`.
+#[cfg(feature = "v1")]
+pub async fn call_unified_connector_service_for_frm_pre_risk_check(
+    state: &SessionState,
+    processor: &Processor,
+    merchant_connector_account: MerchantConnectorAccountType,
+    connector_name: String,
+    profile_id: &id_type::ProfileId,
+    context: FrmPreRiskCheckContext<'_>,
+) -> RouterResult<FraudCheckResponseData> {
+    let ucs_client = get_ucs_client(state)?;
+
+    let connector_auth_metadata = build_unified_connector_service_auth_metadata(
+        merchant_connector_account,
+        processor.get_account().get_id(),
+        connector_name,
+    )
+    .change_context(errors::ApiErrorResponse::InternalServerError)
+    .attach_printable("Failed to build UCS auth metadata for the FRM pre risk check")?;
+
+    let request = payments_grpc::FrmServicePreRiskCheckRequest::foreign_try_from(context)
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to build the FRM pre risk check request")?;
+
+    let lineage_ids = LineageIds::new(processor.get_account().get_id().clone(), profile_id.clone());
+
+    let grpc_headers = state
+        .get_grpc_headers_ucs(common_enums::ExecutionMode::Primary)
+        .lineage_ids(lineage_ids)
+        .external_vault_proxy_metadata(None)
+        .merchant_reference_id(None)
+        .resource_id(None)
+        .build();
+
+    let response = ucs_client
+        .frm_pre_risk_check(request, connector_auth_metadata, grpc_headers)
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("UCS frm_pre_risk_check gRPC call failed")?;
+
+    handle_unified_connector_service_response_for_frm_pre_risk_check(response.into_inner())
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to parse the UCS FRM pre risk check response")
+}
