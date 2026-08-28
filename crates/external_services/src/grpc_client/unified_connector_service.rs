@@ -1607,6 +1607,9 @@ fn build_unified_connector_service_grpc_headers_for_connector_type(
         ConnectorType::PaymentProcessor => consts::UCS_HEADER_CONNECTOR,
         ConnectorType::PayoutProcessor => consts::UCS_HEADER_PAYOUT_CONNECTOR,
         ConnectorType::SurchargeProcessor => consts::UCS_HEADER_SURCHARGE_CONNECTOR,
+        // FRM providers are onboarded as `payment_vas` and are selected by
+        // `x-frm-connector`, the same way surcharge uses its own header.
+        ConnectorType::PaymentVas => consts::UCS_HEADER_FRM_CONNECTOR,
         connector_type => {
             return Err(
                 UnifiedConnectorServiceError::RequestEncodingFailedWithReason(format!(

@@ -182,6 +182,27 @@ where
                         .ok()
                 });
 
+            // Bearer-authenticated providers (Kount) need an OAuth token in
+            // `state.access_token`; static-key providers (nSure) get `None` and
+            // ignore it. Failure here is non-fatal — the connector surfaces a
+            // clear auth error rather than us guessing.
+            let access_token =
+                crate::core::unified_connector_service::frm::get_frm_access_token(
+                    state,
+                    platform.get_processor(),
+                    &frm_data.connector_details.connector_name,
+                    &merchant_connector_account,
+                    &frm_data.connector_details.profile_id,
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    router_env::logger::warn!(
+                        error = ?err,
+                        "Failed to obtain an FRM access token; continuing without one"
+                    );
+                    None
+                });
+
             let context = crate::core::unified_connector_service::frm::FrmPreRiskCheckContext {
                 amount: frm_data.payment_attempt.net_amount.get_total_amount(),
                 currency,
@@ -191,6 +212,7 @@ where
                 order_details: frm_data.order_details.as_ref(),
                 merchant_transaction_id: frm_data.payment_attempt.attempt_id.clone(),
                 frm_metadata: frm_data.frm_metadata.as_ref(),
+                access_token: access_token.as_ref(),
             };
 
             let response =

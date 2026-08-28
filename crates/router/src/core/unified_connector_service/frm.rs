@@ -111,6 +111,9 @@ pub struct FrmPreRiskCheckContext<'a> {
     /// Merchant-supplied provider signals (device id, tenure, velocity, …),
     /// forwarded verbatim as `connector_feature_data`.
     pub frm_metadata: Option<&'a common_utils::pii::SecretSerdeValue>,
+    /// OAuth token for providers whose risk API is bearer-authenticated (Kount).
+    /// Providers using a static key (nSure) leave this unset.
+    pub access_token: Option<&'a hyperswitch_domain_models::router_data::AccessToken>,
 }
 
 impl ForeignTryFrom<FrmPreRiskCheckContext<'_>> for payments_grpc::FrmServicePreRiskCheckRequest {
@@ -156,6 +159,16 @@ impl ForeignTryFrom<FrmPreRiskCheckContext<'_>> for payments_grpc::FrmServicePre
             connector_feature_data: ctx
                 .frm_metadata
                 .map(|metadata| Secret::new(metadata.clone().expose().to_string())),
+            // Bearer-authenticated providers read the token from
+            // `state.access_token`; prism threads it onto FrmFlowData.
+            state: ctx.access_token.map(|token| payments_grpc::ConnectorState {
+                access_token: Some(payments_grpc::AccessToken {
+                    token: Some(token.token.clone()),
+                    expires_in_seconds: Some(token.expires),
+                    token_type: None,
+                }),
+                connector_customer_id: None,
+            }),
             ..Default::default()
         })
     }
@@ -319,4 +332,90 @@ pub async fn call_unified_connector_service_for_frm_pre_risk_check(
     handle_unified_connector_service_response_for_frm_pre_risk_check(response.into_inner())
         .change_context(errors::ApiErrorResponse::InternalServerError)
         .attach_printable("Failed to parse the UCS FRM pre risk check response")
+}
+
+/// Fetch (and cache) the OAuth token a bearer-authenticated FRM provider needs.
+///
+/// Kount's risk API is bearer-authenticated: prism reads the token from
+/// `state.access_token` and cannot mint one itself on the plain FRM service.
+/// Reads Redis first, falling back to UCS `CreateServerAuthenticationToken`.
+/// Providers using a static key (nSure) never reach this — `should_do_access_token`
+/// is connector-side, so we gate on whether UCS returns a token at all.
+#[cfg(feature = "v1")]
+pub async fn get_frm_access_token(
+    state: &SessionState,
+    processor: &Processor,
+    connector_name: &str,
+    merchant_connector_account: &MerchantConnectorAccountType,
+    profile_id: &id_type::ProfileId,
+) -> RouterResult<Option<hyperswitch_domain_models::router_data::AccessToken>> {
+    let merchant_id = processor.get_account().get_id();
+    let access_token_key = common_utils::access_token::get_default_access_token_key(
+        merchant_id,
+        connector_name.to_string(),
+    );
+
+    if let Ok(Some(token)) = state.store.get_access_token(access_token_key.clone()).await {
+        router_env::logger::debug!(connector = connector_name, "FRM access token cache hit");
+        return Ok(Some(token));
+    }
+
+    let ucs_client = get_ucs_client(state)?;
+    let connector_auth_metadata = build_unified_connector_service_auth_metadata(
+        merchant_connector_account.clone(),
+        merchant_id,
+        connector_name.to_string(),
+    )
+    .change_context(errors::ApiErrorResponse::InternalServerError)
+    .attach_printable("Failed to build UCS auth metadata for the FRM access token")?;
+
+    let grpc_headers = state
+        .get_grpc_headers_ucs(common_enums::ExecutionMode::Primary)
+        .lineage_ids(LineageIds::new(merchant_id.clone(), profile_id.clone()))
+        .external_vault_proxy_metadata(None)
+        .merchant_reference_id(None)
+        .resource_id(None)
+        .build();
+
+    let response = ucs_client
+        .create_access_token(
+            payments_grpc::MerchantAuthenticationServiceCreateServerAuthenticationTokenRequest::default(),
+            connector_auth_metadata,
+            grpc_headers,
+            common_enums::ConnectorType::PaymentVas,
+        )
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("UCS create_access_token gRPC call failed for FRM")?;
+
+    let (token_result, _status) =
+        super::handle_unified_connector_service_response_for_create_access_token(
+            response.into_inner(),
+        )
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to parse the UCS FRM access token response")?;
+
+    match token_result {
+        Ok(token) => {
+            // Best-effort cache; a write failure only costs an extra token call.
+            let _ = super::set_access_token_for_ucs(
+                state,
+                processor,
+                connector_name,
+                token.clone(),
+                None,
+                None,
+            )
+            .await;
+            Ok(Some(token))
+        }
+        Err(err) => {
+            router_env::logger::error!(
+                connector = connector_name,
+                error = ?err,
+                "UCS returned an error for the FRM access token"
+            );
+            Ok(None)
+        }
+    }
 }
