@@ -1854,11 +1854,20 @@ pub fn build_unified_connector_service_grpc_headers_for_notify_connector(
     // Remove the default connector header
     metadata.remove(consts::UCS_HEADER_CONNECTOR);
 
-    // Choose header based on event type
+    // Choose header based on event type. FRM events are routed by
+    // `x-frm-connector` (mirroring the risk-check path); surcharge events by
+    // `x-surcharge-connector`; everything else by the default `x-connector`.
     let is_surcharge_event = matches!(
         event_type,
         payments_grpc::NotifyEventType::SurchargePaymentSucceeded
             | payments_grpc::NotifyEventType::SurchargeRefundSucceeded
+    );
+    let is_frm_event = matches!(
+        event_type,
+        payments_grpc::NotifyEventType::FrmPaymentSucceeded
+            | payments_grpc::NotifyEventType::FrmPaymentFailure
+            | payments_grpc::NotifyEventType::FrmRefundProcessed
+            | payments_grpc::NotifyEventType::FrmChargebackReceived
     );
 
     let connector_name = meta.connector_name.clone();
@@ -1879,6 +1888,8 @@ pub fn build_unified_connector_service_grpc_headers_for_notify_connector(
 
     if is_surcharge_event {
         metadata.append(consts::UCS_HEADER_SURCHARGE_CONNECTOR, connector_value);
+    } else if is_frm_event {
+        metadata.append(consts::UCS_HEADER_FRM_CONNECTOR, connector_value);
     } else {
         metadata.append(consts::UCS_HEADER_CONNECTOR, connector_value);
     }

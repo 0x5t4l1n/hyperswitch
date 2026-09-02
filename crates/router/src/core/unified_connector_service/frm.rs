@@ -418,3 +418,139 @@ pub async fn get_frm_access_token(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lifecycle notifications
+//
+// prism exposes four FRM notification events on a single `NotifyConnector` RPC:
+//
+//   FRM_PAYMENT_SUCCEEDED · FRM_PAYMENT_FAILURE
+//   FRM_REFUND_PROCESSED  · FRM_CHARGEBACK_RECEIVED
+//
+// They differ only in the event type and which `notification_type` variant is
+// populated; auth, headers, token and response handling are identical. The
+// generic sender below owns that shared work so each event is a thin caller.
+// Chargeback is wired here; the payment/refund events follow the same shape.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Which lifecycle event to report, plus the detail payload it carries.
+pub enum FrmNotification {
+    /// A chargeback/dispute was opened against a previously-scored payment.
+    ChargebackReceived {
+        connector_dispute_id: Option<String>,
+        merchant_dispute_id: Option<String>,
+        chargeback_reason: Option<String>,
+    },
+}
+
+impl FrmNotification {
+    fn event_type(&self) -> payments_grpc::NotifyEventType {
+        match self {
+            Self::ChargebackReceived { .. } => {
+                payments_grpc::NotifyEventType::FrmChargebackReceived
+            }
+        }
+    }
+
+    fn notification_type(self) -> payments_grpc::frm_notification_content::NotificationType {
+        match self {
+            Self::ChargebackReceived {
+                connector_dispute_id,
+                merchant_dispute_id,
+                chargeback_reason,
+            } => payments_grpc::frm_notification_content::NotificationType::Chargeback(
+                payments_grpc::FrmChargebackDetails {
+                    connector_dispute_id,
+                    merchant_dispute_id,
+                    chargeback_reason,
+                },
+            ),
+        }
+    }
+}
+
+/// Facts shared by every FRM lifecycle notification.
+pub struct FrmNotificationContext<'a> {
+    pub amount: MinorUnit,
+    pub currency: common_enums::Currency,
+    pub connector_transaction_id: Option<String>,
+    /// Correlation id returned by the original risk check. Without it the
+    /// provider cannot tie the notification to the transaction it scored.
+    pub frm_transaction_id: Option<String>,
+    pub profile_id: &'a id_type::ProfileId,
+}
+
+/// Send an FRM lifecycle notification to the connector-service.
+///
+/// Generic over the event: the caller supplies the [`FrmNotification`] variant
+/// and this handles auth metadata, `x-frm-connector` routing, the access token
+/// for bearer-authenticated providers, and the gRPC call.
+#[cfg(feature = "v1")]
+pub async fn call_unified_connector_service_for_frm_notification(
+    state: &SessionState,
+    processor: &Processor,
+    merchant_connector_account: MerchantConnectorAccountType,
+    connector_name: String,
+    context: FrmNotificationContext<'_>,
+    notification: FrmNotification,
+) -> RouterResult<()> {
+    let ucs_client = get_ucs_client(state)?;
+
+    let connector_auth_metadata = build_unified_connector_service_auth_metadata(
+        merchant_connector_account,
+        processor.get_account().get_id(),
+        connector_name.clone(),
+    )
+    .change_context(errors::ApiErrorResponse::InternalServerError)
+    .attach_printable("Failed to build UCS auth metadata for the FRM notification")?;
+
+    let grpc_currency = payments_grpc::Currency::foreign_try_from(context.currency)
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to convert currency for the FRM notification")?;
+
+    let event_type = notification.event_type();
+
+    let content = payments_grpc::NotifyConnectorContent {
+        content: Some(
+            payments_grpc::notify_connector_content::Content::FrmNotification(
+                payments_grpc::FrmNotificationContent {
+                    connector_transaction_id: context.connector_transaction_id.clone(),
+                    amount: Some(payments_grpc::Money {
+                        minor_amount: context.amount.get_amount_as_i64(),
+                        currency: grpc_currency.into(),
+                    }),
+                    frm_transaction_id: context.frm_transaction_id.clone(),
+                    notification_type: Some(notification.notification_type()),
+                    ..Default::default()
+                },
+            ),
+        ),
+    };
+
+    let request = payments_grpc::NotifyConnectorRequest {
+        event_id: format!("frm-{}", common_utils::generate_id_with_default_len("evt")),
+        event_type: event_type.into(),
+        content: Some(content),
+        timestamp: common_utils::date_time::now_unix_timestamp(),
+        ..Default::default()
+    };
+
+    let grpc_headers = state
+        .get_grpc_headers_ucs(common_enums::ExecutionMode::Primary)
+        .lineage_ids(LineageIds::new(
+            processor.get_account().get_id().clone(),
+            context.profile_id.clone(),
+        ))
+        .external_vault_proxy_metadata(None)
+        .merchant_reference_id(None)
+        .resource_id(None)
+        .build();
+
+    ucs_client
+        .notify_connector(request, connector_auth_metadata, grpc_headers, event_type)
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("UCS notify_connector gRPC call failed for the FRM notification")?;
+
+    Ok(())
+}
