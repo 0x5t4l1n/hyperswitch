@@ -1502,22 +1502,31 @@ pub async fn trigger_subscriptions_outgoing_webhook(
     let created_at = subscription.created_at;
     let business_profile = profile.clone();
 
-    tokio::spawn(async move {
-        Box::pin(webhooks_core::create_event_and_trigger_outgoing_webhook(
-            cloned_state,
-            platform,
-            common_enums::enums::EventType::InvoicePaid,
-            common_enums::enums::EventClass::Subscriptions,
-            invoice_id,
-            common_enums::EventObjectType::SubscriptionDetails,
-            webhooks::OutgoingWebhookContent::SubscriptionDetails(Box::new(response)),
-            Some(created_at),
-            webhook_recipient,
-            None,
-            business_profile,
-        ))
-        .await
-    });
+    // Detached: `.in_current_span()` carries whatever span is active. Unlike the
+    // other sites in this file that is NOT a request here — this is reached only
+    // from the `invoice_sync` process-tracker workflow, so it carries the
+    // workflow's span, as `workflows/dispute_list.rs` already does. Deliberately
+    // no span of its own, so its boundaries address below rank 2 — see
+    // `crates/router/tests/detached_spawn_inventory.rs`.
+    tokio::spawn(
+        async move {
+            Box::pin(webhooks_core::create_event_and_trigger_outgoing_webhook(
+                cloned_state,
+                platform,
+                common_enums::enums::EventType::InvoicePaid,
+                common_enums::enums::EventClass::Subscriptions,
+                invoice_id,
+                common_enums::EventObjectType::SubscriptionDetails,
+                webhooks::OutgoingWebhookContent::SubscriptionDetails(Box::new(response)),
+                Some(created_at),
+                webhook_recipient,
+                None,
+                business_profile,
+            ))
+            .await
+        }
+        .in_current_span(),
+    );
 
     Ok(())
 }

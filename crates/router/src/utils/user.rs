@@ -16,7 +16,7 @@ use error_stack::ResultExt;
 use hyperswitch_domain_models::merchant_connector_account::MerchantConnectorAccount as DomainMerchantConnectorAccount;
 use hyperswitch_masking::{ExposeInterface, Secret};
 use redis_interface::RedisConnectionWithContext;
-use router_env::{env, instrument, logger, tracing};
+use router_env::{env, instrument, logger, tracing, tracing::Instrument};
 
 use crate::{
     consts::user::{REDIS_SSO_PREFIX, REDIS_SSO_TTL},
@@ -359,27 +359,33 @@ pub fn spawn_async_lineage_context_update_to_db(
     let state = state.clone();
     let lineage_context = lineage_context.clone();
     let user_id = user_id.to_owned();
-    tokio::spawn(async move {
-        match state
-            .global_store
-            .update_active_user_by_user_id(
-                &user_id,
-                diesel_models::user::UserUpdate::LineageContextUpdate { lineage_context },
-            )
-            .await
-        {
-            Ok(_) => {
-                logger::debug!("Successfully updated lineage context for user {}", user_id);
-            }
-            Err(e) => {
-                logger::error!(
-                    "Failed to update lineage context for user {}: {:?}",
-                    user_id,
-                    e
-                );
+    // Detached: `.in_current_span()` is what attributes this work to the request
+    // that spawned it. Deliberately no span of its own, so its boundaries address
+    // below rank 2 — see `crates/router/tests/detached_spawn_inventory.rs`.
+    tokio::spawn(
+        async move {
+            match state
+                .global_store
+                .update_active_user_by_user_id(
+                    &user_id,
+                    diesel_models::user::UserUpdate::LineageContextUpdate { lineage_context },
+                )
+                .await
+            {
+                Ok(_) => {
+                    logger::debug!("Successfully updated lineage context for user {}", user_id);
+                }
+                Err(e) => {
+                    logger::error!(
+                        "Failed to update lineage context for user {}: {:?}",
+                        user_id,
+                        e
+                    );
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
 }
 
 pub fn generate_env_specific_merchant_id(value: String) -> UserResult<id_type::MerchantId> {

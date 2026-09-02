@@ -1082,24 +1082,30 @@ pub async fn sync_refund_with_gateway(
     };
 
     // If the original refund status was not success and upon a force sync it is now success, in that case we update the state metadata of the payment intent
-    tokio::spawn({
-        let state = state.clone();
-        let processor = platform.get_processor().clone();
-        let payment_intent = payment_intent.clone();
-        let state_metadata = payment_intent.state_metadata.clone().unwrap_or_default();
+    // Detached: `.in_current_span()` is what attributes this work to the request
+    // that spawned it. Deliberately no span of its own, so its boundaries address
+    // below rank 2 — see `crates/router/tests/detached_spawn_inventory.rs`.
+    tokio::spawn(
+        {
+            let state = state.clone();
+            let processor = platform.get_processor().clone();
+            let payment_intent = payment_intent.clone();
+            let state_metadata = payment_intent.state_metadata.clone().unwrap_or_default();
 
-        async move {
-            if let Err(err) = PaymentIntentStateMetadataExt::from(state_metadata)
-                .update_intent_state_metadata_for_refund(&state, &processor, payment_intent)
-                .await
-            {
-                logger::error!(
-                    ?err,
-                    "Failed to update payment intent state metadata after refund sync"
-                );
+            async move {
+                if let Err(err) = PaymentIntentStateMetadataExt::from(state_metadata)
+                    .update_intent_state_metadata_for_refund(&state, &processor, payment_intent)
+                    .await
+                {
+                    logger::error!(
+                        ?err,
+                        "Failed to update payment intent state metadata after refund sync"
+                    );
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
 
     let response = state
         .store
@@ -1449,28 +1455,35 @@ pub async fn validate_and_create_refund(
 
             // Update the state metadata of the payment intent if the refund is successful
             if updated_refund.refund_status.is_success() {
-                tokio::spawn({
-                    let state = state.clone();
-                    let processor = platform.get_processor().clone();
-                    let payment_intent = payment_intent.clone();
-                    let state_metadata = payment_intent.state_metadata.clone().unwrap_or_default();
+                // Detached: `.in_current_span()` is what attributes this work to the request
+                // that spawned it. Deliberately no span of its own, so its boundaries address
+                // below rank 2 — see `crates/router/tests/detached_spawn_inventory.rs`.
+                tokio::spawn(
+                    {
+                        let state = state.clone();
+                        let processor = platform.get_processor().clone();
+                        let payment_intent = payment_intent.clone();
+                        let state_metadata =
+                            payment_intent.state_metadata.clone().unwrap_or_default();
 
-                    async move {
-                        if let Err(err) = PaymentIntentStateMetadataExt::from(state_metadata)
-                            .update_intent_state_metadata_for_refund(
-                                &state,
-                                &processor,
-                                payment_intent,
-                            )
-                            .await
-                        {
-                            logger::error!(
+                        async move {
+                            if let Err(err) = PaymentIntentStateMetadataExt::from(state_metadata)
+                                .update_intent_state_metadata_for_refund(
+                                    &state,
+                                    &processor,
+                                    payment_intent,
+                                )
+                                .await
+                            {
+                                logger::error!(
                             ?err,
                             "Failed to update payment intent state metadata during refund creation"
                         );
+                            }
                         }
                     }
-                });
+                    .in_current_span(),
+                );
             }
             (updated_refund, raw_response)
         }

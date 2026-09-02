@@ -28,7 +28,7 @@ use hyperswitch_interfaces::webhooks::{
     IncomingWebhookFlowError, IncomingWebhookRequestDetails, WebhookContext, WebhookResourceData,
 };
 use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
-use router_env::{instrument, tracing};
+use router_env::{instrument, tracing, tracing::Instrument};
 
 use super::{types, MERCHANT_ID};
 use crate::{
@@ -1637,19 +1637,29 @@ async fn refunds_incoming_webhook_flow(
     let state_task = state.clone();
     let processor_task = platform.get_processor().clone();
     let payment_intent_task = payment_intent.clone();
-    tokio::spawn(async move {
-        if let Err(err) = PaymentIntentStateMetadataExt::from(
-            payment_intent_task
-                .state_metadata
-                .clone()
-                .unwrap_or_default(),
-        )
-        .update_intent_state_metadata_for_refund(&state_task, &processor_task, payment_intent_task)
-        .await
-        {
-            tracing::error!(?err, "Failed to update intent state metadata for refund");
+    // Detached: `.in_current_span()` is what attributes this work to the request
+    // that spawned it. Deliberately no span of its own, so its boundaries address
+    // below rank 2 — see `crates/router/tests/detached_spawn_inventory.rs`.
+    tokio::spawn(
+        async move {
+            if let Err(err) = PaymentIntentStateMetadataExt::from(
+                payment_intent_task
+                    .state_metadata
+                    .clone()
+                    .unwrap_or_default(),
+            )
+            .update_intent_state_metadata_for_refund(
+                &state_task,
+                &processor_task,
+                payment_intent_task,
+            )
+            .await
+            {
+                tracing::error!(?err, "Failed to update intent state metadata for refund");
+            }
         }
-    });
+        .in_current_span(),
+    );
 
     let event_type: Option<enums::EventType> = updated_refund.refund_status.into();
 
@@ -2489,39 +2499,45 @@ async fn disputes_incoming_webhook_flow(
         if diesel_models::dispute::Dispute::is_not_lost_or_none(&option_dispute)
             && dispute_object.dispute_status == common_enums::DisputeStatus::DisputeLost
         {
-            tokio::spawn({
-                let state = state.clone();
-                let platform = platform.clone();
-                let payment_intent = db
-                    .find_payment_intent_by_payment_id_processor_merchant_id(
-                        &payment_attempt.payment_id,
-                        platform.get_processor().get_account().get_id(),
-                        platform.get_processor().get_key_store(),
-                        platform.get_processor().get_account().storage_scheme,
-                    )
-                    .await
-                    .change_context(errors::ApiErrorResponse::InternalServerError)
-                    .attach_printable("Failed to fetch payment_intent")?;
-                let dispute_object = dispute_object.clone();
-                let state_metadata = payment_intent.state_metadata.clone().unwrap_or_default();
-
-                async move {
-                    if let Err(err) = PaymentIntentStateMetadataExt::from(state_metadata)
-                        .update_intent_state_metadata_for_dispute(
-                            &state,
-                            &platform,
-                            payment_intent,
-                            &dispute_object,
+            // Detached: `.in_current_span()` is what attributes this work to the request
+            // that spawned it. Deliberately no span of its own, so its boundaries address
+            // below rank 2 — see `crates/router/tests/detached_spawn_inventory.rs`.
+            tokio::spawn(
+                {
+                    let state = state.clone();
+                    let platform = platform.clone();
+                    let payment_intent = db
+                        .find_payment_intent_by_payment_id_processor_merchant_id(
+                            &payment_attempt.payment_id,
+                            platform.get_processor().get_account().get_id(),
+                            platform.get_processor().get_key_store(),
+                            platform.get_processor().get_account().storage_scheme,
                         )
                         .await
-                    {
-                        logger::error!(
-                            ?err,
-                            "Failed to update payment intent state metadata after dispute lost"
-                        );
+                        .change_context(errors::ApiErrorResponse::InternalServerError)
+                        .attach_printable("Failed to fetch payment_intent")?;
+                    let dispute_object = dispute_object.clone();
+                    let state_metadata = payment_intent.state_metadata.clone().unwrap_or_default();
+
+                    async move {
+                        if let Err(err) = PaymentIntentStateMetadataExt::from(state_metadata)
+                            .update_intent_state_metadata_for_dispute(
+                                &state,
+                                &platform,
+                                payment_intent,
+                                &dispute_object,
+                            )
+                            .await
+                        {
+                            logger::error!(
+                                ?err,
+                                "Failed to update payment intent state metadata after dispute lost"
+                            );
+                        }
                     }
                 }
-            });
+                .in_current_span(),
+            );
         }
 
         let disputes_response = Box::new(dispute_object.clone().foreign_into());
