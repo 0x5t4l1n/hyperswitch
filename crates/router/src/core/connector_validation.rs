@@ -643,8 +643,12 @@ impl ConnectorAuthTypeAndMetadataValidation<'_> {
                 // delegate to. nSure needs the authorization key plus the
                 // portal Application ID.
                 match self.auth_type {
-                    hyperswitch_domain_models::router_data::ConnectorAuthType::BodyKey { .. }
-                    | hyperswitch_domain_models::router_data::ConnectorAuthType::HeaderKey { .. } => Ok(()),
+                    hyperswitch_domain_models::router_data::ConnectorAuthType::BodyKey {
+                        ..
+                    }
+                    | hyperswitch_domain_models::router_data::ConnectorAuthType::HeaderKey {
+                        ..
+                    } => Ok(()),
                     _ => Err(errors::ConnectorError::FailedToObtainAuthType.into()),
                 }
             }

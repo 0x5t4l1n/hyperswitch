@@ -20,19 +20,18 @@ use std::str::FromStr;
 use common_enums::connector_enums::Connector;
 use common_utils::{errors::CustomResult, id_type, types::MinorUnit};
 use error_stack::ResultExt;
+use external_services::grpc_client::LineageIds;
 use hyperswitch_domain_models::{
-    router_request_types::ResponseId, router_response_types::fraud_check::FraudCheckResponseData,
-    types::OrderDetailsWithAmount,
+    platform::Processor, router_request_types::ResponseId,
+    router_response_types::fraud_check::FraudCheckResponseData, types::OrderDetailsWithAmount,
 };
-use hyperswitch_interfaces::unified_connector_service::transformers;
+use hyperswitch_interfaces::unified_connector_service::{
+    transformers, UnifiedConnectorServiceError,
+};
 use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use unified_connector_service_client::payments as payments_grpc;
 
 use super::{build_unified_connector_service_auth_metadata, get_ucs_client};
-use external_services::grpc_client::LineageIds;
-use hyperswitch_domain_models::platform::Processor;
-use hyperswitch_interfaces::unified_connector_service::UnifiedConnectorServiceError;
-
 use crate::{
     core::{
         errors::{self, RouterResult},
